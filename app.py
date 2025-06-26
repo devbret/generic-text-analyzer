@@ -362,11 +362,11 @@ def analyze_text(file_path):
     for trigram, count in trigram_freq.most_common(TOP_N_NGRAMS):
         report_lines.append(f"{' '.join(trigram)}: {count}")
 
-    report_lines.append(f"\n--- Top {TOP_N_NGRAMS} Most Common Trigrams (Lemmatized) ---")
+    report_lines.append(f"\n--- Top {TOP_N_NGRAMS} Most Common Quadgrams (Lemmatized) ---")
     for quadgram, count in quadgram_freq.most_common(TOP_N_NGRAMS):
         report_lines.append(f"{' '.join(quadgram)}: {count}")
 
-    report_lines.append(f"\n--- Top {TOP_N_NGRAMS} Most Common Trigrams (Lemmatized) ---")
+    report_lines.append(f"\n--- Top {TOP_N_NGRAMS} Most Common Fivegrams (Lemmatized) ---")
     for fivegram, count in fivegram_freq.most_common(TOP_N_NGRAMS):
         report_lines.append(f"{' '.join(fivegram)}: {count}")
 
