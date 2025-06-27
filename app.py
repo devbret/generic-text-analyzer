@@ -58,9 +58,10 @@ except ImportError as e:
 TOP_N_WORDS = 50
 TOP_N_NGRAMS = 50
 TOP_N_ENTITIES = 50
-TOP_N_POS = 30
-NUM_TOPICS = 10
+TOP_N_POS = 50
+NUM_TOPICS = 50
 SUMMARY_SENTENCE_COUNT = 10
+MAX_SPACY_CHARS = 1_000_000
 
 
 # --- NLTK and spaCy Data Downloads ---
@@ -85,7 +86,7 @@ try:
 except OSError:
     print("spaCy 'en_core_web_sm' model not found.")
     print("Please download it by running: python -m spacy download en_core_web_sm")
-    nlp = None 
+    nlp = None
 
 # --- Helper Functions ---
 
@@ -114,7 +115,7 @@ def summarize_txt_file_with_claude(filepath: str) -> str | None:
 
                 response = client.messages.create(
                     model="claude-opus-4-20250514",
-                    max_tokens=2000,
+                    max_tokens=3000,
                     messages=[
                         {
                             "role": "user",
@@ -166,7 +167,7 @@ def _get_wordnet_pos(tag):
     else:
         return 'n'
     
-def split_text(text, max_len=500_000):
+def split_text(text, max_len=1_000_000):
     for i in range(0, len(text), max_len):
         yield text[i:i + max_len]
 
@@ -187,7 +188,7 @@ def _preprocess(text):
     
     return lemmatized_tokens
 
-def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities):
+def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities, sentiment_arc):
     print("\nGenerating visualizations...")
     
     try:
@@ -219,6 +220,26 @@ def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities
         except Exception as e:
             print(f"Could not generate chart '{title}': {e}")
             
+    def create_sentiment_arc_chart(data, filename):
+        if not data:
+            print(f"No data to generate sentiment arc chart.")
+            return
+        try:
+            plt.figure(figsize=(12, 6))
+            plt.plot(data, marker='o', linestyle='-', color='indigo')
+            plt.title('Sentiment Arc of the Document', fontsize=16)
+            plt.xlabel('Document Progression (Part)', fontsize=12)
+            plt.ylabel('Sentiment Polarity', fontsize=12)
+            plt.axhline(0, color='grey', linestyle='--')
+            plt.xticks(range(len(data)), [str(i+1) for i in range(len(data))])
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f"output/{filename}")
+            plt.close()
+            print(f"Chart saved to: {filename}")
+        except Exception as e:
+            print(f"Could not generate sentiment arc chart: {e}")
+
     create_bar_chart(word_freq.most_common(TOP_N_WORDS), 
                      f'Top {TOP_N_WORDS} Most Common Words (Lemmatized)', 
                      f"{output_base}_top_words_chart.png")
@@ -235,6 +256,9 @@ def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities
         create_bar_chart(list(zip(entity_labels, entity_counts)), 
                          f'Top {TOP_N_ENTITIES} Named Entities', 
                          f"{output_base}_top_entities_chart.png")
+
+    if sentiment_arc:
+        create_sentiment_arc_chart(sentiment_arc, f"{output_base}_sentiment_arc.png")
 
 def analyze_text(file_path):
     print(f"\nStarting analysis for: {file_path}")
@@ -269,7 +293,7 @@ def analyze_text(file_path):
     fivegram_freq = Counter(ngrams(lemmatized_tokens, 5))
 
     # --- 3. Advanced Analyses ---
-    # Sentiment Analysis
+    # Sentiment Analysis (Overall)
     sentiment = TextBlob(text).sentiment
 
     # Part-of-Speech (POS) Tagging on Lemmatized Tokens
@@ -283,9 +307,10 @@ def analyze_text(file_path):
 
     # Named Entity Recognition (NER)
     all_ents = Counter()
-    for chunk in split_text(text):
-        doc = nlp(chunk)
-        all_ents.update([(ent.text.strip(), ent.label_) for ent in doc.ents])
+    if nlp:
+        for chunk in split_text(text, MAX_SPACY_CHARS):
+            doc_chunk = nlp(chunk)
+            all_ents.update([(ent.text.strip(), ent.label_) for ent in doc_chunk.ents])
     named_entities = all_ents
 
     # TF-IDF Keyword Extraction
@@ -307,10 +332,79 @@ def analyze_text(file_path):
     except Exception as e:
         topics = [f"Could not perform topic modeling: {e}"]
     
-    # --- 4. Generate Report ---
+    # --- 4. NEW: Automated Sense-Making Logic ---
+    
+    # 4a. Thematic Concept Identification
+    top_nouns_set = {word for word, count in noun_freq.most_common(TOP_N_WORDS)}
+    top_tfidf_set = {word for word, score in tfidf_word_scores[:TOP_N_WORDS]}
+    top_entity_text_set = {ent[0].lower() for ent, count in named_entities.most_common(TOP_N_ENTITIES)}
+    key_concepts = top_nouns_set.intersection(top_tfidf_set)
+    entity_concepts = key_concepts.intersection(top_entity_text_set)
+
+    # 4b. Entity-Centric Analysis (Entity Profiling)
+    entity_profiles = {} 
+    if nlp and named_entities:
+        print("\nStarting Entity Profiling Analysis (processing text in chunks)...")
+        top_entities_to_profile = [ent[0] for ent, count in named_entities.most_common(10)]
+        
+        aggregated_profiles = {
+            entity_text: {'actions': Counter(), 'descriptors': Counter()}
+            for entity_text in top_entities_to_profile
+        }
+
+        for chunk in split_text(text, MAX_SPACY_CHARS):
+            doc_chunk = nlp(chunk)
+            for ent in doc_chunk.ents:
+                if ent.text in aggregated_profiles:
+                    # Find action (verb) where entity is the subject
+                    if ent.root.dep_ == 'nsubj' and ent.root.head.pos_ == 'VERB':
+                        aggregated_profiles[ent.text]['actions'][ent.root.head.lemma_] += 1
+                    # Find descriptor (adjective) modifying the entity
+                    for child in ent.root.children:
+                        if child.pos_ == 'ADJ':
+                            aggregated_profiles[ent.text]['descriptors'][child.lemma_] += 1
+        
+        for entity, counters in aggregated_profiles.items():
+            actions = counters['actions'].most_common(5)
+            descriptors = counters['descriptors'].most_common(5)
+            if actions or descriptors:
+                entity_profiles[entity] = {'actions': actions, 'descriptors': descriptors}
+
+    # 4c. Sentiment Arc Analysis
+    sentiment_arc = []
+    if sentences:
+        num_chunks = 20
+        chunk_size = max(1, len(sentences) // num_chunks)
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = (i + 1) * chunk_size if i < num_chunks - 1 else len(sentences)
+            if start < len(sentences):
+                chunk_text = " ".join(sentences[start:end])
+                if chunk_text:
+                    chunk_sentiment = TextBlob(chunk_text).sentiment.polarity
+                    sentiment_arc.append(chunk_sentiment)
+
+    # --- 5. Generate Report ---
     report_lines = []
+    
     report_lines.append("=" * 60)
-    report_lines.append(f"Enhanced Text Analysis Report for: {file_path}")
+    report_lines.append("AUTOMATED SENSE-MAKING INSIGHTS")
+    report_lines.append("=" * 60)
+    
+    report_lines.append("\n--- Key Thematic Concepts (Noun & TF-IDF Overlap) ---")
+    if key_concepts:
+        report_lines.append(", ".join(sorted(list(key_concepts))))
+    else:
+        report_lines.append("No significant overlap found between top nouns and TF-IDF keywords.")
+
+    report_lines.append("\n--- Core Entities (Key Themes that are also Entities) ---")
+    if entity_concepts:
+        report_lines.append(", ".join(sorted(list(entity_concepts))))
+    else:
+        report_lines.append("No key concepts were also identified as top named entities.")
+    report_lines.append("\n" + "=" * 60)
+
+    report_lines.append(f"\nEnhanced Text Analysis Report for: {file_path}")
     report_lines.append("=" * 60)
 
     report_lines.append("\n--- Basic Statistics ---")
@@ -325,9 +419,13 @@ def analyze_text(file_path):
     report_lines.append(f"Gunning Fog Index: {textstat.gunning_fog(text):.2f}")
     report_lines.append(f"SMOG Index: {textstat.smog_index(text)}")
 
-    report_lines.append("\n--- Sentiment Analysis ---")
+    report_lines.append("\n--- Sentiment Analysis (Overall) ---")
     report_lines.append(f"Polarity: {sentiment.polarity:.2f} (Ranges from -1 [negative] to +1 [positive])")
     report_lines.append(f"Subjectivity: {sentiment.subjectivity:.2f} (Ranges from 0 [objective] to 1 [subjective])")
+    
+    report_lines.append(f"\n--- Sentiment Arc (document split into {len(sentiment_arc)} parts) ---")
+    arc_scores_str = [f"{score:.2f}" for score in sentiment_arc]
+    report_lines.append(" -> ".join(arc_scores_str))
 
     report_lines.append(f"\n--- Discovered Topics (LDA, {NUM_TOPICS} topics) ---")
     for topic_num, topic_words in topics:
@@ -342,6 +440,17 @@ def analyze_text(file_path):
         for (entity, label), count in named_entities.most_common(TOP_N_ENTITIES):
             report_lines.append(f"{entity} ({label}): {count}")
     
+    if entity_profiles:
+        report_lines.append(f"\n--- Key Entity Profiles ---")
+        for entity, profile in entity_profiles.items():
+            report_lines.append(f"\nProfile for '{entity}':")
+            if profile['actions']:
+                action_str = ", ".join([f"{v[0]} ({v[1]})" for v in profile['actions']])
+                report_lines.append(f"  - Common Actions: {action_str}")
+            if profile['descriptors']:
+                desc_str = ", ".join([f"{d[0]} ({d[1]})" for d in profile['descriptors']])
+                report_lines.append(f"  - Common Descriptors: {desc_str}")
+
     report_lines.append(f"\n--- Top {TOP_N_POS} Most Common Nouns (Lemmatized) ---")
     for word, count in noun_freq.most_common(TOP_N_POS):
         report_lines.append(f"{word}: {count}")
@@ -370,7 +479,7 @@ def analyze_text(file_path):
     for fivegram, count in fivegram_freq.most_common(TOP_N_NGRAMS):
         report_lines.append(f"{' '.join(fivegram)}: {count}")
 
-    # --- 5. Output Results ---
+    # --- 6. Output Results ---
     final_report = "\n".join(report_lines)
 
     filename = os.path.basename(file_path)
@@ -391,11 +500,11 @@ def analyze_text(file_path):
     except Exception as e:
         print(f"\nError: Could not save report. {e}")
 
-    # --- 6. Generate and Save Visualizations ---
-    _generate_visualizations(basename, word_freq, bigram_freq, named_entities)
+    # --- 7. Generate and Save Visualizations ---
+    _generate_visualizations(basename, word_freq, bigram_freq, named_entities, sentiment_arc)
     print("\nAnalysis complete.")
 
-    # --- 7. Claude Analysis ---
+    # --- 8. Claude Analysis ---
     summary = summarize_txt_file_with_claude(output_filepath)
     if summary:
         summary_filename = os.path.splitext(output_filepath)[0] + "_claude_summary.md"
