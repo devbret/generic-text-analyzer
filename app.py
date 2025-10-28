@@ -8,8 +8,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# --- Library Imports ---
-
 try:
     import nltk
     from nltk.corpus import stopwords
@@ -52,43 +50,50 @@ except ImportError as e:
     print("Required: 'wordcloud', 'matplotlib', 'seaborn', 'gensim', 'scikit-learn'")
     sys.exit()
 
-
-# --- Configuration ---
-
 TOP_N_WORDS = 50
 TOP_N_NGRAMS = 50
 TOP_N_ENTITIES = 50
 TOP_N_POS = 50
 NUM_TOPICS = 50
-SUMMARY_SENTENCE_COUNT = 10
-MAX_SPACY_CHARS = 1_000_000
+SUMMARY_SENTENCE_COUNT = 43
+MAX_SPACY_CHARS = 250_000
 
-
-# --- NLTK and spaCy Data Downloads ---
 def download_nltk_data():
-    nltk_packages = ['punkt', 'stopwords', 'averaged_perceptron_tagger', 'wordnet']
-    for package in nltk_packages:
+    needed = {
+        'punkt': 'tokenizers/punkt',
+        'stopwords': 'corpora/stopwords',
+        'averaged_perceptron_tagger': 'taggers/averaged_perceptron_tagger',
+        'wordnet': 'corpora/wordnet',
+        'vader_lexicon': 'sentiment/vader_lexicon.zip',
+    }
+    for pkg, path in needed.items():
         try:
-            if package == 'punkt':
-                 path = f'tokenizers/{package}'
-            elif package.endswith('_tagger'):
-                 path = f'taggers/{package}'
-            else:
-                 path = f'corpora/{package}'
             nltk.data.find(path)
         except LookupError:
-            print(f"Downloading NLTK data '{package}'...")
+            nltk.download(pkg, quiet=True)
+
+    try:
+        nltk.data.find('tokenizers/punkt_tab')
+    except LookupError:
+        try:
+            nltk.download('punkt_tab', quiet=True)
+        except Exception:
+            pass
 
 download_nltk_data()
 
 try:
     nlp = spacy.load('en_core_web_sm')
+    nlp.max_length = max(nlp.max_length, MAX_SPACY_CHARS)
+    if hasattr(nlp, "max_length"):
+        print("spaCy 'en_core_web_sm' model not found.")
+        print("Please download it by running: python -m spacy download en_core_web_sm")
+        nlp = None
 except OSError:
     print("spaCy 'en_core_web_sm' model not found.")
     print("Please download it by running: python -m spacy download en_core_web_sm")
     nlp = None
 
-# --- Helper Functions ---
 
 def summarize_txt_file_with_claude(filepath: str) -> str | None:
     print(f"\nReading and summarizing: {filepath}")
@@ -115,7 +120,7 @@ def summarize_txt_file_with_claude(filepath: str) -> str | None:
 
                 response = client.messages.create(
                     model="claude-opus-4-20250514",
-                    max_tokens=3000,
+                    max_tokens=4300,
                     messages=[
                         {
                             "role": "user",
@@ -167,33 +172,66 @@ def _get_wordnet_pos(tag):
     else:
         return 'n'
     
-def split_text(text, max_len=1_000_000):
-    for i in range(0, len(text), max_len):
-        yield text[i:i + max_len]
+def split_text(text: str, max_len: int = MAX_SPACY_CHARS):
+    start = 0
+    text_len = len(text)
+    while start < text_len:
+        end = min(start + max_len, text_len)
+        if end < text_len:
+            next_period = text.rfind('.', start, end)
+            if next_period != -1 and next_period > start + 0.8 * max_len:
+                end = next_period + 1
+        yield text[start:end]
+        start = end
 
-def _preprocess(text):
+def _preprocess_nltk(text: str):
     text_lower = text.lower()
-    text_cleaned = re.sub(r'[^\w\s]', '', text_lower)
-    
+    text_cleaned = re.sub(r"[^\w\s]", " ", text_lower)
+
     tokens = word_tokenize(text_cleaned)
-    
+
     stop_words = set(stopwords.words('english'))
     custom_stopwords = ["uh", "um", "like", "yeah", "im", "dont", "go", "know", "going", "thats", "think", "let", "lets"]
     stop_words.update(custom_stopwords)
     filtered_tokens = [word for word in tokens if word not in stop_words and len(word) > 1]
-    
+
     lemmatizer = WordNetLemmatizer()
     pos_tags_for_lemma = pos_tag(filtered_tokens)
     lemmatized_tokens = [lemmatizer.lemmatize(word, _get_wordnet_pos(tag)) for word, tag in pos_tags_for_lemma]
-    
+
     return lemmatized_tokens
+
+def _preprocess(text: str):
+    text = re.sub(r"[^\w\s]", " ", text.lower())
+    
+    if nlp:
+        doc = nlp(text)
+        stop_words = set(stopwords.words('english'))
+        custom = {"uh","um","like","yeah","im","dont","go","know","going","thats","think","let","lets"}
+        stop_words |= custom
+        lemmatized = [
+            t.lemma_.lower()
+            for t in doc
+            if (
+                not t.is_space
+                and not t.like_num
+                and t.lemma_.isalpha()
+                and t.text.lower() not in stop_words
+                and not t.is_stop
+                and len(t) > 1
+            )
+        ]
+        return lemmatized
+    else:
+        return _preprocess_nltk(text)
 
 def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities, sentiment_arc):
     print("\nGenerating visualizations...")
     
     try:
-        wordcloud = WordCloud(width=1200, height=600, background_color='white', colormap='viridis').generate_from_frequencies(word_freq)
+        wordcloud = WordCloud(width=1200, height=600, background_color='white', colormap='viridis', collocations=False).generate_from_frequencies(word_freq)
         wordcloud_filename = f"{output_base}_wordcloud.png"
+        os.makedirs("output", exist_ok=True)
         wordcloud.to_file(f"output/{wordcloud_filename}")
         print(f"Word cloud saved to: {wordcloud_filename}")
     except Exception as e:
@@ -214,6 +252,7 @@ def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities
             plt.title(title, fontsize=16)
             plt.xlabel('Frequency', fontsize=12)
             plt.tight_layout()
+            os.makedirs("output", exist_ok=True)
             plt.savefig(f"output/{filename}")
             plt.close()
             print(f"Chart saved to: {filename}")
@@ -234,6 +273,7 @@ def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities
             plt.xticks(range(len(data)), [str(i+1) for i in range(len(data))])
             plt.grid(True)
             plt.tight_layout()
+            os.makedirs("output", exist_ok=True)
             plt.savefig(f"output/{filename}")
             plt.close()
             print(f"Chart saved to: {filename}")
@@ -276,7 +316,6 @@ def analyze_text(file_path):
         print("The file is empty. Analysis cannot proceed.")
         return
 
-    # --- 1. Preprocessing ---
     lemmatized_tokens = _preprocess(text)
     if not lemmatized_tokens:
         print("The text is too short or contains only stopwords. Analysis cannot proceed.")
@@ -285,18 +324,14 @@ def analyze_text(file_path):
     sentences = sent_tokenize(text)
     original_tokens = word_tokenize(text.lower())
 
-    # --- 2. Core Analyses ---
     word_freq = Counter(lemmatized_tokens)
     bigram_freq = Counter(ngrams(lemmatized_tokens, 2))
     trigram_freq = Counter(ngrams(lemmatized_tokens, 3))
     quadgram_freq = Counter(ngrams(lemmatized_tokens, 4))
     fivegram_freq = Counter(ngrams(lemmatized_tokens, 5))
 
-    # --- 3. Advanced Analyses ---
-    # Sentiment Analysis (Overall)
     sentiment = TextBlob(text).sentiment
 
-    # Part-of-Speech (POS) Tagging on Lemmatized Tokens
     pos_tags = pos_tag(lemmatized_tokens)
     nouns = [word for word, tag in pos_tags if tag.startswith('NN')]
     verbs = [word for word, tag in pos_tags if tag.startswith('VB')]
@@ -305,7 +340,6 @@ def analyze_text(file_path):
     verb_freq = Counter(verbs)
     adjective_freq = Counter(adjectives)
 
-    # Named Entity Recognition (NER)
     all_ents = Counter()
     if nlp:
         for chunk in split_text(text, MAX_SPACY_CHARS):
@@ -313,7 +347,6 @@ def analyze_text(file_path):
             all_ents.update([(ent.text.strip(), ent.label_) for ent in doc_chunk.ents])
     named_entities = all_ents
 
-    # TF-IDF Keyword Extraction
     vectorizer = TfidfVectorizer(stop_words='english', tokenizer=word_tokenize)
     try:
         tfidf_matrix = vectorizer.fit_transform(sent_tokenize(text))
@@ -323,7 +356,6 @@ def analyze_text(file_path):
     except ValueError:
         tfidf_word_scores = []
 
-    # Topic Modeling (LDA)
     try:
         dictionary = corpora.Dictionary([lemmatized_tokens])
         corpus = [dictionary.doc2bow(lemmatized_tokens)]
@@ -332,16 +364,12 @@ def analyze_text(file_path):
     except Exception as e:
         topics = [f"Could not perform topic modeling: {e}"]
     
-    # --- 4. NEW: Automated Sense-Making Logic ---
-    
-    # 4a. Thematic Concept Identification
     top_nouns_set = {word for word, count in noun_freq.most_common(TOP_N_WORDS)}
     top_tfidf_set = {word for word, score in tfidf_word_scores[:TOP_N_WORDS]}
     top_entity_text_set = {ent[0].lower() for ent, count in named_entities.most_common(TOP_N_ENTITIES)}
     key_concepts = top_nouns_set.intersection(top_tfidf_set)
     entity_concepts = key_concepts.intersection(top_entity_text_set)
 
-    # 4b. Entity-Centric Analysis (Entity Profiling)
     entity_profiles = {} 
     if nlp and named_entities:
         print("\nStarting Entity Profiling Analysis (processing text in chunks)...")
@@ -356,13 +384,13 @@ def analyze_text(file_path):
             doc_chunk = nlp(chunk)
             for ent in doc_chunk.ents:
                 if ent.text in aggregated_profiles:
-                    # Find action (verb) where entity is the subject
-                    if ent.root.dep_ == 'nsubj' and ent.root.head.pos_ == 'VERB':
-                        aggregated_profiles[ent.text]['actions'][ent.root.head.lemma_] += 1
-                    # Find descriptor (adjective) modifying the entity
-                    for child in ent.root.children:
-                        if child.pos_ == 'ADJ':
-                            aggregated_profiles[ent.text]['descriptors'][child.lemma_] += 1
+                    sent = ent.sent
+                    for token in sent:
+                        if token.dep_ in ('nsubj', 'nsubjpass') and ent.start <= token.i <= ent.end - 1:
+                            if token.head.pos_ == 'VERB':
+                                aggregated_profiles[ent.text]['actions'][token.head.lemma_] += 1
+                        if token.dep_ == 'amod' and ent.start <= token.head.i <= ent.end - 1:
+                            aggregated_profiles[ent.text]['descriptors'][token.lemma_] += 1
         
         for entity, counters in aggregated_profiles.items():
             actions = counters['actions'].most_common(5)
@@ -370,7 +398,13 @@ def analyze_text(file_path):
             if actions or descriptors:
                 entity_profiles[entity] = {'actions': actions, 'descriptors': descriptors}
 
-    # 4c. Sentiment Arc Analysis
+    from nltk.sentiment import SentimentIntensityAnalyzer
+    try:
+        nltk.data.find('sentiment/vader_lexicon.zip')
+    except LookupError:
+        nltk.download('vader_lexicon', quiet=True)
+
+    sia = SentimentIntensityAnalyzer()
     sentiment_arc = []
     if sentences:
         num_chunks = 20
@@ -381,10 +415,9 @@ def analyze_text(file_path):
             if start < len(sentences):
                 chunk_text = " ".join(sentences[start:end])
                 if chunk_text:
-                    chunk_sentiment = TextBlob(chunk_text).sentiment.polarity
-                    sentiment_arc.append(chunk_sentiment)
+                    compound = sia.polarity_scores(chunk_text)['compound']
+                    sentiment_arc.append(compound)
 
-    # --- 5. Generate Report ---
     report_lines = []
     
     report_lines.append("=" * 60)
@@ -411,7 +444,9 @@ def analyze_text(file_path):
     report_lines.append(f"Total Word Count (raw): {len(original_tokens)}")
     report_lines.append(f"Total Sentence Count: {len(sentences)}")
     report_lines.append(f"Unique Lemmatized Words (filtered): {len(word_freq)}")
-    report_lines.append(f"Average Word Length: {sum(len(w) for w in original_tokens) / len(original_tokens):.2f}")
+    alpha_tokens = [t for t in original_tokens if t.isalpha()]
+    avg_len = (sum(map(len, alpha_tokens)) / len(alpha_tokens)) if alpha_tokens else 0
+    report_lines.append(f"Average Word Length: {avg_len:.2f}")
 
     report_lines.append("\n--- Readability Scores ---")
     report_lines.append(f"Flesch Reading Ease: {textstat.flesch_reading_ease(text):.2f} (Higher is easier)")
@@ -423,13 +458,17 @@ def analyze_text(file_path):
     report_lines.append(f"Polarity: {sentiment.polarity:.2f} (Ranges from -1 [negative] to +1 [positive])")
     report_lines.append(f"Subjectivity: {sentiment.subjectivity:.2f} (Ranges from 0 [objective] to 1 [subjective])")
     
-    report_lines.append(f"\n--- Sentiment Arc (document split into {len(sentiment_arc)} parts) ---")
+    report_lines.append(f"\n--- Sentiment Arc (document split into {len(sentiment_arc)} parts, VADER compound) ---")
     arc_scores_str = [f"{score:.2f}" for score in sentiment_arc]
     report_lines.append(" -> ".join(arc_scores_str))
 
     report_lines.append(f"\n--- Discovered Topics (LDA, {NUM_TOPICS} topics) ---")
-    for topic_num, topic_words in topics:
-        report_lines.append(f"Topic {topic_num + 1}: {topic_words}")
+    for topic in topics:
+        if isinstance(topic, tuple) and len(topic) == 2:
+            topic_num, topic_words = topic
+            report_lines.append(f"Topic {topic_num + 1}: {topic_words}")
+        else:
+            report_lines.append(str(topic))
 
     report_lines.append(f"\n--- Top {TOP_N_WORDS} Keywords (by TF-IDF score) ---")
     for word, score in tfidf_word_scores[:TOP_N_WORDS]:
@@ -479,7 +518,6 @@ def analyze_text(file_path):
     for fivegram, count in fivegram_freq.most_common(TOP_N_NGRAMS):
         report_lines.append(f"{' '.join(fivegram)}: {count}")
 
-    # --- 6. Output Results ---
     final_report = "\n".join(report_lines)
 
     filename = os.path.basename(file_path)
@@ -500,11 +538,9 @@ def analyze_text(file_path):
     except Exception as e:
         print(f"\nError: Could not save report. {e}")
 
-    # --- 7. Generate and Save Visualizations ---
     _generate_visualizations(basename, word_freq, bigram_freq, named_entities, sentiment_arc)
     print("\nAnalysis complete.")
 
-    # --- 8. Claude Analysis ---
     summary = summarize_txt_file_with_claude(output_filepath)
     if summary:
         summary_filename = os.path.splitext(output_filepath)[0] + "_claude_summary.md"
@@ -517,9 +553,33 @@ def analyze_text(file_path):
     else:
         print("No summary generated.")
 
+    return {
+        "file": file_path,
+        "report": output_filepath
+    }
+
 if __name__ == "__main__":
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     input_dir = "input"
-    for filename in os.listdir(input_dir):
-        if filename.endswith(".txt"):
-            file_path = os.path.join(input_dir, filename)
-            analyze_text(file_path)
+    if not os.path.isdir(input_dir):
+        print(f"Input directory '{input_dir}' not found.")
+        sys.exit(1)
+
+    txt_files = [os.path.join(input_dir, fn) for fn in os.listdir(input_dir) if fn.endswith(".txt")]
+
+    if not txt_files:
+        print(f"No .txt files found in '{input_dir}'.")
+        sys.exit(0)
+
+    results = []
+    max_workers = min(4, os.cpu_count() or 1)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(analyze_text, path) for path in txt_files]
+        for fut in as_completed(futures):
+            try:
+                res = fut.result()
+                if res:
+                    results.append(res)
+            except Exception as e:
+                print(f"Error processing a file in parallel: {e}")
