@@ -85,10 +85,6 @@ download_nltk_data()
 try:
     nlp = spacy.load('en_core_web_sm')
     nlp.max_length = max(nlp.max_length, MAX_SPACY_CHARS)
-    if hasattr(nlp, "max_length"):
-        print("spaCy 'en_core_web_sm' model not found.")
-        print("Please download it by running: python -m spacy download en_core_web_sm")
-        nlp = None
 except OSError:
     print("spaCy 'en_core_web_sm' model not found.")
     print("Please download it by running: python -m spacy download en_core_web_sm")
@@ -357,9 +353,10 @@ def analyze_text(file_path):
         tfidf_word_scores = []
 
     try:
+        num_topics = min(NUM_TOPICS, max(3, len(lemmatized_tokens) // 500))
         dictionary = corpora.Dictionary([lemmatized_tokens])
         corpus = [dictionary.doc2bow(lemmatized_tokens)]
-        lda_model = LdaModel(corpus, num_topics=NUM_TOPICS, id2word=dictionary, passes=10, random_state=42)
+        lda_model = LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=10, random_state=42)
         topics = lda_model.print_topics(num_words=5)
     except Exception as e:
         topics = [f"Could not perform topic modeling: {e}"]
@@ -462,7 +459,7 @@ def analyze_text(file_path):
     arc_scores_str = [f"{score:.2f}" for score in sentiment_arc]
     report_lines.append(" -> ".join(arc_scores_str))
 
-    report_lines.append(f"\n--- Discovered Topics (LDA, {NUM_TOPICS} topics) ---")
+    report_lines.append(f"\n--- Discovered Topics (LDA, {num_topics} topics) ---")
     for topic in topics:
         if isinstance(topic, tuple) and len(topic) == 2:
             topic_num, topic_words = topic
