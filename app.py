@@ -1,12 +1,23 @@
 import sys
 import re
 import os
+import logging
 import anthropic
-import time
 from collections import Counter
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(processName)s] %(levelname)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# Silence noisy third-party loggers (gensim's per-pass training trace, the
+# anthropic/httpx request log) so only this script's progress is shown.
+for _noisy in ("gensim", "httpx", "httpcore", "anthropic"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 try:
     import nltk
@@ -16,40 +27,43 @@ try:
     from nltk.stem import WordNetLemmatizer
     from nltk import pos_tag
 except ImportError:
-    print("NLTK library not found. Please run: pip install nltk")
+    logger.error("NLTK library not found. Please run: pip install nltk")
     sys.exit()
 
 try:
     from textblob import TextBlob
 except ImportError:
-    print("TextBlob library not found. Please run: pip install textblob")
+    logger.error("TextBlob library not found. Please run: pip install textblob")
     sys.exit()
 
 try:
     import spacy
 except ImportError:
-    print("spaCy library not found. Please run: pip install spacy")
-    print("You also need to download a spaCy model, e.g., python -m spacy download en_core_web_sm")
+    logger.error("spaCy library not found. Please run: pip install spacy")
+    logger.error("You also need to download a spaCy model, e.g., python -m spacy download en_core_web_sm")
     sys.exit()
 
 try:
     import textstat
 except ImportError:
-    print("textstat library not found. Please run: pip install textstat")
+    logger.error("textstat library not found. Please run: pip install textstat")
     sys.exit()
 
 try:
     from wordcloud import WordCloud
+    import matplotlib
+    matplotlib.use("Agg")  # headless/multiprocess-safe backend for chart generation
     import matplotlib.pyplot as plt
     import seaborn as sns
     from gensim import corpora
     from gensim.models import LdaModel
     from sklearn.feature_extraction.text import TfidfVectorizer
 except ImportError as e:
-    print(f"A required library is missing: {e.name}. Please install it.")
-    print("Required: 'wordcloud', 'matplotlib', 'seaborn', 'gensim', 'scikit-learn'")
+    logger.error("A required library is missing: %s. Please install it.", e.name)
+    logger.error("Required: 'wordcloud', 'matplotlib', 'seaborn', 'gensim', 'scikit-learn'")
     sys.exit()
 
+CLAUDE_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-20250514")
 TOP_N_WORDS = 50
 TOP_N_NGRAMS = 50
 TOP_N_ENTITIES = 50
@@ -86,74 +100,57 @@ try:
     nlp = spacy.load('en_core_web_sm')
     nlp.max_length = max(nlp.max_length, MAX_SPACY_CHARS)
 except OSError:
-    print("spaCy 'en_core_web_sm' model not found.")
-    print("Please download it by running: python -m spacy download en_core_web_sm")
+    logger.error("spaCy 'en_core_web_sm' model not found.")
+    logger.error("Please download it by running: python -m spacy download en_core_web_sm")
     nlp = None
 
 
 def summarize_txt_file_with_claude(filepath: str) -> str | None:
-    print(f"\nReading and summarizing: {filepath}")
-    
+    logger.info("Reading and summarizing: %s", filepath)
+
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             file_content = f.read()
     except Exception as e:
-        print(f"Error reading file: {e}")
+        logger.error("Error reading file %s: %s", filepath, e)
         return None
 
-    max_retries = 5
-    initial_wait_time = 1
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        logger.error("Anthropic API key not found. Please check your .env file.")
+        return None
+
+    # The Anthropic SDK automatically retries 429/5xx/529 (overloaded) responses
+    # with exponential backoff, so no manual retry loop is needed.
+    client = anthropic.Anthropic(api_key=api_key, max_retries=5)
 
     try:
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        if not client.api_key:
-            raise ValueError("Anthropic API key not found.")
+        logger.info("Connecting to Anthropic API for text summary...")
+        response = client.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=4300,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""
+                    Please summarize the following document in clear and concise language suitable for a general audience.
 
-        for attempt in range(max_retries):
-            try:
-                print("\nConnecting to Anthropic API for text summary...")
-                print("--- AI-Generated Summary ---")
+                    Highlight:
+                    - The main topics covered
+                    - Any key arguments or insights
+                    - Notable conclusions, themes, or recommendations
 
-                response = client.messages.create(
-                    model="claude-opus-4-20250514",
-                    max_tokens=4300,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": f"""
-                            Please summarize the following document in clear and concise language suitable for a general audience.
-
-                            Highlight:
-                            - The main topics covered
-                            - Any key arguments or insights
-                            - Notable conclusions, themes, or recommendations
-
-                            Here is the text:
-                            {file_content}
-                            """
-                        }
-                    ],
-                )
-
-                print("Summary successfully generated.")
-                return response.content[0].text
-
-            except anthropic.APIStatusError as e:
-                if e.status_code == 529 and 'overloaded_error' in e.response.text:
-                    if attempt < max_retries - 1:
-                        wait_time = initial_wait_time * (2 ** attempt)
-                        print(f"\nAPI is overloaded. Retrying in {wait_time} seconds...")
-                        time.sleep(wait_time)
-                    else:
-                        raise
-                else:
-                    raise
-
+                    Here is the text:
+                    {file_content}
+                    """
+                }
+            ],
+        )
+        logger.info("Summary successfully generated.")
+        return response.content[0].text
     except Exception as e:
-        print(f"\n--- ANTHROPIC API ERROR ---")
-        print(f"An error occurred: {e}")
-        print("Please check your .env file and network connection.")
-        print("---------------------------\n")
+        logger.error("Anthropic API error: %s", e)
+        logger.error("Please check your .env file and network connection.")
         return None
 
 def _get_wordnet_pos(tag):
@@ -221,43 +218,64 @@ def _preprocess(text: str):
     else:
         return _preprocess_nltk(text)
 
+def _build_lda_documents(text: str, sentences: list):
+    """Split a single document into multiple pseudo-documents for topic modeling.
+
+    LDA learns topics from word co-occurrence *across* documents, so running it on
+    one bag-of-words is meaningless. Prefer paragraph boundaries; fall back to
+    grouping sentences into chunks when there are too few paragraphs.
+    """
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+    if len(paragraphs) >= 5:
+        chunks = paragraphs
+    else:
+        num_chunks = min(20, max(5, len(sentences) // 5))
+        chunk_size = max(1, len(sentences) // num_chunks)
+        chunks = [
+            " ".join(sentences[i:i + chunk_size])
+            for i in range(0, len(sentences), chunk_size)
+        ]
+
+    documents = [_preprocess(chunk) for chunk in chunks]
+    return [doc for doc in documents if doc]
+
 def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities, sentiment_arc):
-    print("\nGenerating visualizations...")
-    
+    logger.info("Generating visualizations...")
+
     try:
         wordcloud = WordCloud(width=1200, height=600, background_color='white', colormap='viridis', collocations=False).generate_from_frequencies(word_freq)
         wordcloud_filename = f"{output_base}_wordcloud.png"
         os.makedirs("output", exist_ok=True)
         wordcloud.to_file(f"output/{wordcloud_filename}")
-        print(f"Word cloud saved to: {wordcloud_filename}")
+        logger.info("Word cloud saved to: %s", wordcloud_filename)
     except Exception as e:
-        print(f"Could not generate word cloud: {e}")
+        logger.error("Could not generate word cloud: %s", e)
 
     plt.style.use('seaborn-v0_8-whitegrid')
 
     def create_bar_chart(data, title, filename):
         if not data:
-            print(f"No data to generate chart: {title}")
+            logger.warning("No data to generate chart: %s", title)
             return
         try:
             items = [item for item, count in data]
             counts = [count for item, count in data]
-            
+
             plt.figure(figsize=(10, 8))
-            sns.barplot(x=counts, y=items, palette='plasma')
+            sns.barplot(x=counts, y=items, hue=items, legend=False, palette='plasma')
             plt.title(title, fontsize=16)
             plt.xlabel('Frequency', fontsize=12)
             plt.tight_layout()
             os.makedirs("output", exist_ok=True)
             plt.savefig(f"output/{filename}")
             plt.close()
-            print(f"Chart saved to: {filename}")
+            logger.info("Chart saved to: %s", filename)
         except Exception as e:
-            print(f"Could not generate chart '{title}': {e}")
-            
+            logger.error("Could not generate chart '%s': %s", title, e)
+
     def create_sentiment_arc_chart(data, filename):
         if not data:
-            print(f"No data to generate sentiment arc chart.")
+            logger.warning("No data to generate sentiment arc chart.")
             return
         try:
             plt.figure(figsize=(12, 6))
@@ -272,49 +290,51 @@ def _generate_visualizations(output_base, word_freq, bigram_freq, named_entities
             os.makedirs("output", exist_ok=True)
             plt.savefig(f"output/{filename}")
             plt.close()
-            print(f"Chart saved to: {filename}")
+            logger.info("Chart saved to: %s", filename)
         except Exception as e:
-            print(f"Could not generate sentiment arc chart: {e}")
+            logger.error("Could not generate sentiment arc chart: %s", e)
 
-    create_bar_chart(word_freq.most_common(TOP_N_WORDS), 
-                     f'Top {TOP_N_WORDS} Most Common Words (Lemmatized)', 
+    create_bar_chart(word_freq.most_common(TOP_N_WORDS),
+                     f'Top {TOP_N_WORDS} Most Common Words (Lemmatized)',
                      f"{output_base}_top_words_chart.png")
 
-    bigram_labels = [' '.join(b) for b, c in bigram_freq.most_common(TOP_N_NGRAMS)]
-    bigram_counts = [c for b, c in bigram_freq.most_common(TOP_N_NGRAMS)]
-    create_bar_chart(list(zip(bigram_labels, bigram_counts)), 
-                     f'Top {TOP_N_NGRAMS} Most Common Bigrams', 
+    top_bigrams = bigram_freq.most_common(TOP_N_NGRAMS)
+    bigram_labels = [' '.join(b) for b, c in top_bigrams]
+    bigram_counts = [c for b, c in top_bigrams]
+    create_bar_chart(list(zip(bigram_labels, bigram_counts)),
+                     f'Top {TOP_N_NGRAMS} Most Common Bigrams',
                      f"{output_base}_top_bigrams_chart.png")
 
     if named_entities:
-        entity_labels = [f"{ent[0]} ({ent[1]})" for ent, count in named_entities.most_common(TOP_N_ENTITIES)]
-        entity_counts = [count for ent, count in named_entities.most_common(TOP_N_ENTITIES)]
-        create_bar_chart(list(zip(entity_labels, entity_counts)), 
-                         f'Top {TOP_N_ENTITIES} Named Entities', 
+        top_entities = named_entities.most_common(TOP_N_ENTITIES)
+        entity_labels = [f"{ent[0]} ({ent[1]})" for ent, count in top_entities]
+        entity_counts = [count for ent, count in top_entities]
+        create_bar_chart(list(zip(entity_labels, entity_counts)),
+                         f'Top {TOP_N_ENTITIES} Named Entities',
                          f"{output_base}_top_entities_chart.png")
 
     if sentiment_arc:
         create_sentiment_arc_chart(sentiment_arc, f"{output_base}_sentiment_arc.png")
 
 def analyze_text(file_path):
-    print(f"\nStarting analysis for: {file_path}")
+    logger.info("Starting analysis for: %s", file_path)
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
             text = file.read()
     except FileNotFoundError:
-        print(f"Error: The file at '{file_path}' was not found.")
+        logger.error("The file at '%s' was not found.", file_path)
         return
     except Exception as e:
-        print(f"An error occurred while reading the file: {e}")
+        logger.error("An error occurred while reading the file: %s", e)
         return
 
     if not text.strip():
-        print("The file is empty. Analysis cannot proceed.")
+        logger.warning("The file is empty. Analysis cannot proceed.")
         return
 
     lemmatized_tokens = _preprocess(text)
     if not lemmatized_tokens:
-        print("The text is too short or contains only stopwords. Analysis cannot proceed.")
+        logger.warning("The text is too short or contains only stopwords. Analysis cannot proceed.")
         return
     
     sentences = sent_tokenize(text)
@@ -343,7 +363,7 @@ def analyze_text(file_path):
             all_ents.update([(ent.text.strip(), ent.label_) for ent in doc_chunk.ents])
     named_entities = all_ents
 
-    vectorizer = TfidfVectorizer(stop_words='english', tokenizer=word_tokenize)
+    vectorizer = TfidfVectorizer(stop_words='english', tokenizer=word_tokenize, token_pattern=None)
     try:
         tfidf_matrix = vectorizer.fit_transform(sent_tokenize(text))
         feature_names = vectorizer.get_feature_names_out()
@@ -352,14 +372,25 @@ def analyze_text(file_path):
     except ValueError:
         tfidf_word_scores = []
 
-    try:
-        num_topics = min(NUM_TOPICS, max(3, len(lemmatized_tokens) // 500))
-        dictionary = corpora.Dictionary([lemmatized_tokens])
-        corpus = [dictionary.doc2bow(lemmatized_tokens)]
-        lda_model = LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=10, random_state=42)
-        topics = lda_model.print_topics(num_words=5)
-    except Exception as e:
-        topics = [f"Could not perform topic modeling: {e}"]
+    lda_documents = _build_lda_documents(text, sentences)
+    if len(lda_documents) < 3:
+        num_topics = 0
+        topics = ["Topic modeling skipped: the document could not be split into enough sections."]
+    else:
+        try:
+            num_topics = min(NUM_TOPICS, max(2, len(lda_documents) // 3))
+            dictionary = corpora.Dictionary(lda_documents)
+            if len(dictionary) > 50:
+                dictionary.filter_extremes(no_below=2, no_above=0.5)
+            corpus = [bow for bow in (dictionary.doc2bow(doc) for doc in lda_documents) if bow]
+            if not corpus:
+                raise ValueError("vocabulary is empty after filtering")
+            num_topics = min(num_topics, len(corpus))
+            lda_model = LdaModel(corpus, num_topics=num_topics, id2word=dictionary, passes=10, random_state=42)
+            topics = lda_model.print_topics(num_words=5)
+        except Exception as e:
+            num_topics = 0
+            topics = [f"Could not perform topic modeling: {e}"]
     
     top_nouns_set = {word for word, count in noun_freq.most_common(TOP_N_WORDS)}
     top_tfidf_set = {word for word, score in tfidf_word_scores[:TOP_N_WORDS]}
@@ -369,7 +400,7 @@ def analyze_text(file_path):
 
     entity_profiles = {} 
     if nlp and named_entities:
-        print("\nStarting Entity Profiling Analysis (processing text in chunks)...")
+        logger.info("Starting entity profiling analysis (processing text in chunks)...")
         top_entities_to_profile = [ent[0] for ent, count in named_entities.most_common(10)]
         
         aggregated_profiles = {
@@ -529,14 +560,12 @@ def analyze_text(file_path):
     try:
         with open(output_filepath, 'w', encoding='utf-8') as f:
             f.write(final_report)
-        print("\n" + "=" * 60)
-        print(f"Report saved to: {output_filepath}")
-        print("=" * 60)
+        logger.info("Report saved to: %s", output_filepath)
     except Exception as e:
-        print(f"\nError: Could not save report. {e}")
+        logger.error("Could not save report: %s", e)
 
     _generate_visualizations(basename, word_freq, bigram_freq, named_entities, sentiment_arc)
-    print("\nAnalysis complete.")
+    logger.info("Analysis complete for: %s", file_path)
 
     summary = summarize_txt_file_with_claude(output_filepath)
     if summary:
@@ -544,11 +573,11 @@ def analyze_text(file_path):
         try:
             with open(summary_filename, 'w', encoding='utf-8') as f:
                 f.write(summary)
-            print(f"\nClaude summary saved to: {summary_filename}")
+            logger.info("Claude summary saved to: %s", summary_filename)
         except Exception as e:
-            print(f"\nError: Could not save Claude summary. {e}")
+            logger.error("Could not save Claude summary: %s", e)
     else:
-        print("No summary generated.")
+        logger.warning("No summary generated.")
 
     return {
         "file": file_path,
@@ -560,13 +589,13 @@ if __name__ == "__main__":
 
     input_dir = "input"
     if not os.path.isdir(input_dir):
-        print(f"Input directory '{input_dir}' not found.")
+        logger.error("Input directory '%s' not found.", input_dir)
         sys.exit(1)
 
     txt_files = [os.path.join(input_dir, fn) for fn in os.listdir(input_dir) if fn.endswith(".txt")]
 
     if not txt_files:
-        print(f"No .txt files found in '{input_dir}'.")
+        logger.warning("No .txt files found in '%s'.", input_dir)
         sys.exit(0)
 
     results = []
@@ -579,4 +608,4 @@ if __name__ == "__main__":
                 if res:
                     results.append(res)
             except Exception as e:
-                print(f"Error processing a file in parallel: {e}")
+                logger.error("Error processing a file in parallel: %s", e)
