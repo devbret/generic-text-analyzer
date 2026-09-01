@@ -4,6 +4,7 @@ import os
 import logging
 import anthropic
 from collections import Counter
+from functools import lru_cache
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -14,8 +15,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Silence noisy third-party loggers (gensim's per-pass training trace, the
-# anthropic/httpx request log) so only this script's progress is shown.
 for _noisy in ("gensim", "httpx", "httpcore", "anthropic"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
@@ -52,7 +51,7 @@ except ImportError:
 try:
     from wordcloud import WordCloud
     import matplotlib
-    matplotlib.use("Agg")  # headless/multiprocess-safe backend for chart generation
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import seaborn as sns
     from gensim import corpora
@@ -63,7 +62,7 @@ except ImportError as e:
     logger.error("Required: 'wordcloud', 'matplotlib', 'seaborn', 'gensim', 'scikit-learn'")
     sys.exit()
 
-CLAUDE_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-20250514")
+CLAUDE_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
 TOP_N_WORDS = 50
 TOP_N_NGRAMS = 50
 TOP_N_ENTITIES = 50
@@ -71,6 +70,11 @@ TOP_N_POS = 50
 NUM_TOPICS = 50
 SUMMARY_SENTENCE_COUNT = 43
 MAX_SPACY_CHARS = 250_000
+
+CUSTOM_STOPWORDS = {
+    "uh", "um", "like", "yeah", "im", "dont", "go", "know",
+    "going", "thats", "think", "let", "lets",
+}
 
 def download_nltk_data():
     needed = {
@@ -120,8 +124,6 @@ def summarize_txt_file_with_claude(filepath: str) -> str | None:
         logger.error("Anthropic API key not found. Please check your .env file.")
         return None
 
-    # The Anthropic SDK automatically retries 429/5xx/529 (overloaded) responses
-    # with exponential backoff, so no manual retry loop is needed.
     client = anthropic.Anthropic(api_key=api_key, max_retries=5)
 
     try:
@@ -164,7 +166,7 @@ def _get_wordnet_pos(tag):
         return 'r'
     else:
         return 'n'
-    
+
 def split_text(text: str, max_len: int = MAX_SPACY_CHARS):
     start = 0
     text_len = len(text)
@@ -177,54 +179,91 @@ def split_text(text: str, max_len: int = MAX_SPACY_CHARS):
         yield text[start:end]
         start = end
 
-def _preprocess_nltk(text: str):
-    text_lower = text.lower()
-    text_cleaned = re.sub(r"[^\w\s]", " ", text_lower)
 
-    tokens = word_tokenize(text_cleaned)
+@lru_cache(maxsize=1)
+def _stop_words() -> frozenset:
+    words = set(stopwords.words('english'))
+    words.update(CUSTOM_STOPWORDS)
+    return frozenset(words)
 
-    stop_words = set(stopwords.words('english'))
-    custom_stopwords = ["uh", "um", "like", "yeah", "im", "dont", "go", "know", "going", "thats", "think", "let", "lets"]
-    stop_words.update(custom_stopwords)
-    filtered_tokens = [word for word in tokens if word not in stop_words and len(word) > 1]
 
+_SPACY_TO_COARSE = {
+    "NOUN": "NOUN",
+    "PROPN": "NOUN",
+    "VERB": "VERB",
+    "AUX": "VERB",
+    "ADJ": "ADJ",
+}
+
+
+def _ptb_to_coarse(tag: str) -> str | None:
+    if tag.startswith("NN"):
+        return "NOUN"
+    if tag.startswith("VB"):
+        return "VERB"
+    if tag.startswith("JJ"):
+        return "ADJ"
+    return None
+
+
+def _analyze_tokens_spacy(text: str):
+    stop_words = _stop_words()
+    lemmas = []
+    tagged = []
+
+    for chunk in split_text(text, MAX_SPACY_CHARS):
+        doc = nlp(chunk)
+        for token in doc:
+            if token.is_space or token.like_num or token.is_stop:
+                continue
+            if len(token) <= 1:
+                continue
+            if token.text.lower() in stop_words:
+                continue
+            lemma = token.lemma_.lower()
+            if not lemma.isalpha():
+                continue
+            lemmas.append(lemma)
+            coarse = _SPACY_TO_COARSE.get(token.pos_)
+            if coarse:
+                tagged.append((lemma, coarse))
+
+    return lemmas, tagged
+
+
+def _analyze_tokens_nltk(text: str):
+    stop_words = _stop_words()
     lemmatizer = WordNetLemmatizer()
-    pos_tags_for_lemma = pos_tag(filtered_tokens)
-    lemmatized_tokens = [lemmatizer.lemmatize(word, _get_wordnet_pos(tag)) for word, tag in pos_tags_for_lemma]
+    lemmas = []
+    tagged = []
 
-    return lemmatized_tokens
+    for sentence in sent_tokenize(text):
+        tokens = word_tokenize(sentence)
+        for word, tag in pos_tag(tokens):
+            lower = word.lower()
+            if len(lower) <= 1 or not lower.isalpha() or lower in stop_words:
+                continue
+            lemma = lemmatizer.lemmatize(lower, _get_wordnet_pos(tag))
+            if not lemma.isalpha():
+                continue
+            lemmas.append(lemma)
+            coarse = _ptb_to_coarse(tag)
+            if coarse:
+                tagged.append((lemma, coarse))
+
+    return lemmas, tagged
+
+
+def _analyze_tokens(text: str):
+    if nlp:
+        return _analyze_tokens_spacy(text)
+    return _analyze_tokens_nltk(text)
+
 
 def _preprocess(text: str):
-    text = re.sub(r"[^\w\s]", " ", text.lower())
-    
-    if nlp:
-        doc = nlp(text)
-        stop_words = set(stopwords.words('english'))
-        custom = {"uh","um","like","yeah","im","dont","go","know","going","thats","think","let","lets"}
-        stop_words |= custom
-        lemmatized = [
-            t.lemma_.lower()
-            for t in doc
-            if (
-                not t.is_space
-                and not t.like_num
-                and t.lemma_.isalpha()
-                and t.text.lower() not in stop_words
-                and not t.is_stop
-                and len(t) > 1
-            )
-        ]
-        return lemmatized
-    else:
-        return _preprocess_nltk(text)
+    return _analyze_tokens(text)[0]
 
 def _build_lda_documents(text: str, sentences: list):
-    """Split a single document into multiple pseudo-documents for topic modeling.
-
-    LDA learns topics from word co-occurrence *across* documents, so running it on
-    one bag-of-words is meaningless. Prefer paragraph boundaries; fall back to
-    grouping sentences into chunks when there are too few paragraphs.
-    """
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
     if len(paragraphs) >= 5:
         chunks = paragraphs
@@ -332,11 +371,11 @@ def analyze_text(file_path):
         logger.warning("The file is empty. Analysis cannot proceed.")
         return
 
-    lemmatized_tokens = _preprocess(text)
+    lemmatized_tokens, pos_tagged_tokens = _analyze_tokens(text)
     if not lemmatized_tokens:
         logger.warning("The text is too short or contains only stopwords. Analysis cannot proceed.")
         return
-    
+
     sentences = sent_tokenize(text)
     original_tokens = word_tokenize(text.lower())
 
@@ -348,13 +387,9 @@ def analyze_text(file_path):
 
     sentiment = TextBlob(text).sentiment
 
-    pos_tags = pos_tag(lemmatized_tokens)
-    nouns = [word for word, tag in pos_tags if tag.startswith('NN')]
-    verbs = [word for word, tag in pos_tags if tag.startswith('VB')]
-    adjectives = [word for word, tag in pos_tags if tag.startswith('JJ')]
-    noun_freq = Counter(nouns)
-    verb_freq = Counter(verbs)
-    adjective_freq = Counter(adjectives)
+    noun_freq = Counter(word for word, coarse in pos_tagged_tokens if coarse == "NOUN")
+    verb_freq = Counter(word for word, coarse in pos_tagged_tokens if coarse == "VERB")
+    adjective_freq = Counter(word for word, coarse in pos_tagged_tokens if coarse == "ADJ")
 
     all_ents = Counter()
     if nlp:
@@ -391,18 +426,18 @@ def analyze_text(file_path):
         except Exception as e:
             num_topics = 0
             topics = [f"Could not perform topic modeling: {e}"]
-    
+
     top_nouns_set = {word for word, count in noun_freq.most_common(TOP_N_WORDS)}
     top_tfidf_set = {word for word, score in tfidf_word_scores[:TOP_N_WORDS]}
     top_entity_text_set = {ent[0].lower() for ent, count in named_entities.most_common(TOP_N_ENTITIES)}
     key_concepts = top_nouns_set.intersection(top_tfidf_set)
     entity_concepts = key_concepts.intersection(top_entity_text_set)
 
-    entity_profiles = {} 
+    entity_profiles = {}
     if nlp and named_entities:
         logger.info("Starting entity profiling analysis (processing text in chunks)...")
         top_entities_to_profile = [ent[0] for ent, count in named_entities.most_common(10)]
-        
+
         aggregated_profiles = {
             entity_text: {'actions': Counter(), 'descriptors': Counter()}
             for entity_text in top_entities_to_profile
@@ -419,7 +454,7 @@ def analyze_text(file_path):
                                 aggregated_profiles[ent.text]['actions'][token.head.lemma_] += 1
                         if token.dep_ == 'amod' and ent.start <= token.head.i <= ent.end - 1:
                             aggregated_profiles[ent.text]['descriptors'][token.lemma_] += 1
-        
+
         for entity, counters in aggregated_profiles.items():
             actions = counters['actions'].most_common(5)
             descriptors = counters['descriptors'].most_common(5)
@@ -447,11 +482,11 @@ def analyze_text(file_path):
                     sentiment_arc.append(compound)
 
     report_lines = []
-    
+
     report_lines.append("=" * 60)
     report_lines.append("AUTOMATED SENSE-MAKING INSIGHTS")
     report_lines.append("=" * 60)
-    
+
     report_lines.append("\n--- Key Thematic Concepts (Noun & TF-IDF Overlap) ---")
     if key_concepts:
         report_lines.append(", ".join(sorted(list(key_concepts))))
@@ -485,7 +520,7 @@ def analyze_text(file_path):
     report_lines.append("\n--- Sentiment Analysis (Overall) ---")
     report_lines.append(f"Polarity: {sentiment.polarity:.2f} (Ranges from -1 [negative] to +1 [positive])")
     report_lines.append(f"Subjectivity: {sentiment.subjectivity:.2f} (Ranges from 0 [objective] to 1 [subjective])")
-    
+
     report_lines.append(f"\n--- Sentiment Arc (document split into {len(sentiment_arc)} parts, VADER compound) ---")
     arc_scores_str = [f"{score:.2f}" for score in sentiment_arc]
     report_lines.append(" -> ".join(arc_scores_str))
@@ -506,7 +541,7 @@ def analyze_text(file_path):
         report_lines.append(f"\n--- Top {TOP_N_ENTITIES} Named Entities ---")
         for (entity, label), count in named_entities.most_common(TOP_N_ENTITIES):
             report_lines.append(f"{entity} ({label}): {count}")
-    
+
     if entity_profiles:
         report_lines.append(f"\n--- Key Entity Profiles ---")
         for entity, profile in entity_profiles.items():
@@ -529,7 +564,7 @@ def analyze_text(file_path):
     report_lines.append(f"\n--- Top {TOP_N_POS} Most Common Adjectives (Lemmatized) ---")
     for word, count in adjective_freq.most_common(TOP_N_POS):
         report_lines.append(f"{word}: {count}")
-    
+
     report_lines.append(f"\n--- Top {TOP_N_NGRAMS} Most Common Bigrams (Lemmatized) ---")
     for bigram, count in bigram_freq.most_common(TOP_N_NGRAMS):
         report_lines.append(f"{' '.join(bigram)}: {count}")
